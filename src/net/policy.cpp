@@ -34,16 +34,29 @@ namespace srouter
             throw std::invalid_argument{"Cannot determine protocol name for IP Protocol: {}"_format(proto)};
         }
 
-        bool ProtocolInfo::matches_packet_proto(const IPPacket& pkt) const { return pkt.protocol() == protocol; }
+        bool ProtocolInfo::matches_packet_proto(const IPPacket& pkt) const
+        {
+            if (pkt.protocol() != protocol)
+                return false;
+            // A configured port (e.g. tcp/443) must match the destination port too.
+            if (port)
+                if (auto dp = pkt.dest_port(); not dp or *dp != *port)
+                    return false;
+            return true;
+        }
 
         bool ExitPolicy::allow_ip_traffic(const IPPacket& pkt) const
         {
             // ranges are always the allow list (if empty, we route nothing).  Add a 0.0.0.0/0 or
             // ::/0 if you want to allow everything.
+            // A /0 has to be matched explicitly: contains() masks with to_base(0), which shifts by the
+            // full address width, so 0.0.0.0/0 does not reliably contain anything.
             auto accept_range = pkt.is_ipv4()
-                ? std::ranges::any_of(ranges, [dest = *pkt.dest_ipv4()](const auto& r) { return r.contains(dest); })
+                ? std::ranges::any_of(
+                      ranges, [dest = *pkt.dest_ipv4()](const auto& r) { return r.mask == 0 or r.contains(dest); })
                 : pkt.is_ipv6()
-                ? std::ranges::any_of(ranges_v6, [dest = *pkt.dest_ipv6()](const auto& r) { return r.contains(dest); })
+                ? std::ranges::any_of(
+                      ranges_v6, [dest = *pkt.dest_ipv6()](const auto& r) { return r.mask == 0 or r.contains(dest); })
                 : false;
 
             if (!accept_range)

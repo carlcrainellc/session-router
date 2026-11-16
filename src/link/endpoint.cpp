@@ -329,6 +329,34 @@ namespace srouter::link
         }
     }
 
+    void Endpoint::for_each_edge_conn(std::function<void(const RouterID&, link::Connection&)> func) const
+    {
+        assert(router.loop().inside());
+
+        if (manager.is_stopping)
+            return;
+
+        for (const auto& [rid, conn] : client_conns)
+        {
+            assert(conn && conn->conn);
+            func(rid, *conn);
+        }
+    }
+
+    void Endpoint::for_each_pending_outbound(std::function<void(const RouterID&, link::Connection&)> func) const
+    {
+        assert(router.loop().inside());
+
+        if (manager.is_stopping)
+            return;
+
+        for (const auto& [rid, conn] : pending_outbound)
+        {
+            if (conn and conn->conn)
+                func(rid, *conn);
+        }
+    }
+
     std::unordered_set<RouterID> Endpoint::get_current_relays(bool include_pending) const
     {
         std::unordered_set<RouterID> ret;
@@ -512,6 +540,10 @@ namespace srouter::link
         if (!pending)
         {
             log::debug(logcat, "Initiating new connection to send to {}", rid.short_string());
+            // If default is via TUN, ensure a host route to this relay exists first.
+            router.poke_first_hop(rc.addr());
+            if (rc.addr6())
+                router.poke_first_hop(*rc.addr6());
             auto conn = endpoint->connect(
                 quic::RemoteAddress{rid.to_view(), rc.addr()},
                 tls_creds,

@@ -18,6 +18,7 @@
 #include "nodedb.hpp"
 #include "router/route_poker.hpp"
 #include "router/router.hpp"
+#include "session/session.hpp"
 #include "util/logging/buffer.hpp"
 #include "util/str.hpp"
 
@@ -113,6 +114,40 @@ namespace srouter::handlers
         log::debug(logcat, "Tun constructing IPRange iterator on local networks: {}, {}", _local_net, _local_ipv6_net);
         _local_range_iterator = IPRangeIterator{_local_net};
         _local_ipv6_range_iterator = IPv6RangeIterator{_local_ipv6_net};
+
+        // The route poker is part of the full build, so it lives here rather than in Router; core
+        // code reaches it through the hooks below.
+        _route_poker = std::make_shared<RoutePoker>(_router, *this);
+        _route_poker->start();
+        // Lets the link layer pin a host route to a first hop before dialing it.
+        _router.set_first_hop_poker(
+            [this](const ipv4& ip) {
+                if (_route_poker)
+                    _route_poker->add_first_hop(ip);
+            },
+            [this](const ipv6& ip) {
+                if (_route_poker)
+                    _route_poker->add_first_hop(ip);
+            });
+        _router.set_exit_map_hook([this] {
+            if (_route_poker)
+                _route_poker->update_exit_routes();
+        });
+        // Exit routes go up once there are edge connections to pin.
+        _router.on_connected(
+            [this] {
+                if (_route_poker)
+                    _route_poker->update_exit_routes();
+            },
+            /*with_paths=*/false,
+            /*persistent=*/true);
+        _router.on_disconnected(
+            [this] {
+                if (_route_poker)
+                    _route_poker->put_down();
+            },
+            /*with_paths=*/false,
+            /*persistent=*/true);
     }
 
     static const auto random_snode = "random.{}"_format(RELAY_TLD);
@@ -322,6 +357,82 @@ namespace srouter::handlers
         }
     }
 
+    bool TunEndpoint::remote_is_exit_broker(const NetworkAddress& remote) const
+    {
+        // Only remotes listed in exit.ranges are exit brokers for inbound return traffic.
+        // Do not treat an arbitrary exit-policy ClientContact peer as a broker.
+        return _router.config().exit.ranges.contains(remote);
+    }
+
+    std::optional<NetworkAddress> TunEndpoint::exit_for_ip(const ipv4& dest) const
+    {
+        // Longest-prefix match when ranges overlap (deterministic).
+        std::optional<NetworkAddress> best;
+        int best_mask = -1;
+        for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
+        {
+            for (const auto& r : range_list)
+            {
+                if (const auto* r4 = std::get_if<ipv4_range>(&r))
+                {
+                    // mask==0 is "all IPv4" (bare reserved-range=EXIT.sesh).  oxen-quic
+                    // ipv4::to_base(0) hits <<32 UB and contains() can wrongly return false.
+                    if (r4->mask == 0 or r4->contains(dest))
+                    {
+                        const int m = static_cast<int>(r4->mask);
+                        if (m > best_mask)
+                        {
+                            best_mask = m;
+                            best = exit_addr;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    std::optional<NetworkAddress> TunEndpoint::exit_for_ip(const ipv6& dest) const
+    {
+        std::optional<NetworkAddress> best;
+        int best_mask = -1;
+        for (const auto& [exit_addr, range_list] : _router.config().exit.ranges)
+        {
+            for (const auto& r : range_list)
+            {
+                if (const auto* r6 = std::get_if<ipv6_range>(&r))
+                {
+                    if (r6->mask == 0 or r6->contains(dest))
+                    {
+                        const int m = static_cast<int>(r6->mask);
+                        if (m > best_mask)
+                        {
+                            best_mask = m;
+                            best = exit_addr;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    void TunEndpoint::add_default_route()
+    {
+        if (not _net_if)
+            return;
+        log::info(logcat, "Installing default route via TUN {}", _if_name);
+        _router.vpn_platform()->RouteManager().add_default_route_via_interface(*_net_if);
+    }
+
+    void TunEndpoint::delete_default_route()
+    {
+        if (not _net_if)
+            return;
+        log::info(logcat, "Removing default route via TUN {}", _if_name);
+        _router.vpn_platform()->RouteManager().delete_default_route_via_interface(*_net_if);
+    }
+
     // handles an outbound packet going OUT from user -> network
     void TunEndpoint::handle_outbound_packet(IPPacket pkt)
     {
@@ -372,7 +483,19 @@ namespace srouter::handlers
         // we pass `dest` because that is our local private IP on the outgoing IPPacket
         if (auto remote = is_v4 ? _local_ipv4_mapping[dest4] : _local_ipv6_mapping[dest6])
         {
-            pkt.clear_addresses();
+            // Exit-return traffic: clearnet reply arrives on TUN with src=SERVER dest=mapped-client.
+            // Client from_exit rewrites dest → local TUN IP and *keeps* pkt source as the
+            // clearnet server.  clear_addresses() would zero that source and break TCP.
+            const bool exit_return = is_exit_node()
+                and ((is_v4 and not _local_net.contains(src4)) or ((not is_v4) and not _local_ipv6_net.contains(src6)));
+            if (not exit_return)
+                pkt.clear_addresses();
+            else
+                log::debug(
+                    logcat,
+                    "Exit-return packet to mapped client {} (preserving clearnet addrs): {}",
+                    *remote,
+                    pkt.info_line());
 
             if (auto session = _router.session_endpoint().get_session(*remote))
             {
@@ -404,6 +527,44 @@ namespace srouter::handlers
         }
         else
         {
+            // No direct .sesh mapping for dest — try the reserved-range exit.
+            std::optional<NetworkAddress> exit_remote;
+            if (is_v4)
+                exit_remote = exit_for_ip(dest4);
+            else
+                exit_remote = exit_for_ip(dest6);
+
+            if (exit_remote)
+            {
+                // Keep original dest IP in the packet; exit will NAT/forward it.
+                // Do not send clearnet via a mapped exit until the session is live and
+                // EXIT_CAPABLE — a wrong or not-yet-ready .sesh must not get packets early.
+                auto* session = _router.session_endpoint().get_session(*exit_remote);
+                if (session and session->is_exit_capable)
+                {
+                    log::trace(logcat, "Outbound packet {} routed via exit broker {}", pkt.info_line(), *exit_remote);
+                    session->send_session_data_message(pkt.span(), pkt.protocol());
+                    return;
+                }
+
+                // The exit session is missing or not exit-capable yet: (re)start it and drop the
+                // packet without an ICMP unreachable, which would make TCP abort the connection
+                // instead of retrying once the session is up.
+                if (not session)
+                {
+                    try
+                    {
+                        _router.session_endpoint().initiate_remote_session(*exit_remote, nullptr);
+                    }
+                    catch (const std::exception& e)
+                    {
+                        log::warning(logcat, "Failed to initiate exit session to {}: {}", *exit_remote, e.what());
+                    }
+                }
+                log::trace(logcat, "Dropping packet for mapped exit {} until it is ready", *exit_remote);
+                return;
+            }
+
             log::trace(logcat, "Could not find remote for route {}", pkt.info_line());
 
             // make ICMP unreachable
@@ -414,19 +575,26 @@ namespace srouter::handlers
 
     std::optional<ipv4> TunEndpoint::obtain_src_for_ipv4_remote(const NetworkAddress& remote)
     {
-        if (auto maybe_src = _local_ipv4_mapping[remote])
+        // Allocate on demand so inbound exit traffic from a new client gets a TUN-local src
+        // for NAT/MASQUERADE (map4 inserts into _local_ipv4_mapping).
+        if (auto maybe_src = map4(remote))
             return maybe_src;
 
-        log::warning(logcat, "Unable to find mapped IPv4 for inbound packet from remote {}", remote);
+        log::warning(logcat, "Unable to allocate mapped IPv4 for inbound packet from remote {}", remote);
         return std::nullopt;
     }
     std::optional<ipv6> TunEndpoint::obtain_src_for_ipv6_remote(const NetworkAddress& remote)
     {
-        if (auto maybe_src = _local_ipv6_mapping[remote])
-            return maybe_src;
-
-        log::warning(logcat, "Unable to find mapped IPv6 for inbound packet from remote {}", remote);
-        return std::nullopt;
+        try
+        {
+            return map6(remote);
+        }
+        catch (const std::exception& e)
+        {
+            log::warning(
+                logcat, "Unable to allocate mapped IPv6 for inbound packet from remote {}: {}", remote, e.what());
+            return std::nullopt;
+        }
     }
 
     void TunEndpoint::send_packet_to_net_if(IPPacket pkt)
@@ -445,19 +613,27 @@ namespace srouter::handlers
         send_packet_to_net_if(std::move(pkt));
     }
 
-    // FIXME: we need separate flags for to-exit and from-exit
+    // to_exit: this node is an exit and inbound overlay packets should be forwarded to clearnet.
+    // from_exit: this node is an exit client receiving return traffic from a mapped exit.
     void TunEndpoint::handle_inbound_packet(IPPacket pkt, traffic_type type, NetworkAddress remote)
     {
-        (void)type;              // TODO FIXME use this
-        bool to_exit = false;    // TODO FIXME
-        bool from_exit = false;  // TODO FIXME
+        (void)type;
+        const bool to_exit = is_exit_node();
+        const bool from_exit = (not to_exit) and remote_is_exit_broker(remote);
 
         if (to_exit)  // traffic exiting through this node
         {
             log::trace(logcat, "inbound exit pkt for exit node: {}", pkt.info_line());
             if (not is_allowing_traffic(pkt))
             {
-                log::warning(logcat, "Dropping inbound exit packet: denied by local traffic policy");
+                log::debug(
+                    logcat,
+                    "Dropping inbound exit packet: denied by local traffic policy ({}; proto={} dest_port={} "
+                    "policy={})",
+                    pkt.info_line(),
+                    static_cast<int>(pkt.protocol()),
+                    pkt.dest_port() ? std::to_string(*pkt.dest_port()) : "none",
+                    _exit_policy ? "set" : "null");
                 return;
             }
 
@@ -511,7 +687,8 @@ namespace srouter::handlers
 
     bool TunEndpoint::is_allowing_traffic(const IPPacket& pkt) const
     {
-        return _exit_policy ? _exit_policy->allow_ip_traffic(pkt) : true;
+        // Fail closed: exit enable with no policy must not forward everything.
+        return _exit_policy ? _exit_policy->allow_ip_traffic(pkt) : false;
     }
 
     std::pair<std::optional<ipv4>, std::optional<ipv6>> TunEndpoint::get_mapped_ip(const NetworkAddress& addr)

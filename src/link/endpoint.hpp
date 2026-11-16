@@ -305,6 +305,12 @@ namespace srouter::link
         // connections, this is only called for the preferred direction.
         void for_each_relay_conn(std::function<void(const RouterID&, link::Connection&)> func) const;
 
+        // Calls `func` for each of a client's edge connections (client_conns).
+        void for_each_edge_conn(std::function<void(const RouterID&, link::Connection&)> func) const;
+
+        // Calls `func` for each outbound connection that is still being established.
+        void for_each_pending_outbound(std::function<void(const RouterID&, link::Connection&)> func) const;
+
         void close_connection(const RouterID& rid);
 
         // Closes all connections and stops the network event loop

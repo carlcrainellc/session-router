@@ -64,3 +64,19 @@ if(WIN32)
 endif()
 
 add_custom_target(check COMMAND testAll)
+
+# Exit-side lease admission test target. Standalone: does not need the full router libs.
+add_executable(test_exit_lease_admission
+  auth/test_exit_lease_admission.cpp
+  Catch2/extras/catch_amalgamated.cpp)
+target_include_directories(test_exit_lease_admission PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/Catch2/extras)
+target_link_libraries(test_exit_lease_admission PRIVATE nlohmann_json::nlohmann_json sodium)
+target_compile_features(test_exit_lease_admission PRIVATE cxx_std_20)
+add_custom_target(check_exit_lease COMMAND test_exit_lease_admission DEPENDS test_exit_lease_admission)
+
+add_executable(exit-lease-verify ${PROJECT_SOURCE_DIR}/contrib/exit-lease/verify_main.cpp)
+target_include_directories(exit-lease-verify PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(exit-lease-verify PRIVATE nlohmann_json::nlohmann_json sodium)
+target_compile_features(exit-lease-verify PRIVATE cxx_std_20)

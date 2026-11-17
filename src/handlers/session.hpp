@@ -1,6 +1,7 @@
 #pragma once
 
 #include "address/address.hpp"
+#include "auth/exit_lease_admission.hpp"
 #include "config/config.hpp"
 #include "contact/client_contact.hpp"
 #include "ev/tcp.hpp"
@@ -60,6 +61,11 @@ namespace srouter
             std::optional<std::string_view> fetch_auth_token(const NetworkAddress& remote) const;
 
             void close_session(const std::shared_ptr<session::Session>& s, bool send_close);
+
+            // Inbound sessions admitted by a signed exit lease; dropped by tick() when the lease
+            // expires or is revoked (re-checked every 15 s and immediately at exp).
+            auth::LeaseTracker<NetworkAddress> _lease_sessions{15};
+            void enforce_lease_expiry(sys_ms now);
 
             void on_path_build_failure(int64_t build_id, path::Path* path, bool timeout) override;
             void on_path_build_success(int64_t build_id, path::Path& p) override;
@@ -275,6 +281,10 @@ namespace srouter
             // SessionEndpoint can use either a whitelist or a static auth token list to validate
             // incoming requests to initiate a session
             bool validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth = std::nullopt);
+
+            /// Full auth decision (reason + lease exp) without side effects.
+            auth::ExitLeaseAuthResult auth_decision(
+                const NetworkAddress& remote, const std::optional<std::string>& maybe_auth) const;
 
             // Live MapExit/SwapExits token: apply into the in-memory map used by session init.
             void set_auth_token(const NetworkAddress& remote, std::string token);

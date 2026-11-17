@@ -1,5 +1,10 @@
 #include "session.hpp"
 
+#include "auth/exit_lease_admission.hpp"
+
+#include <cstdlib>
+#include <cstdint>
+
 #include "constants/path.hpp"
 #include "contact/contactdb.hpp"
 #include "contact/relay_contact.hpp"
@@ -163,6 +168,7 @@ namespace srouter::handlers
     void SessionEndpoint::tick(sys_ms now)
     {
         log::trace(logcat, "SessionEndpoint ticking sessions...");
+        enforce_lease_expiry(now);
         for (const auto& [addr, session] : _sessions)
             session->tick(now);
 
@@ -1026,26 +1032,116 @@ namespace srouter::handlers
         }
     }
 
-    bool SessionEndpoint::validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth)
+    auth::ExitLeaseAuthResult SessionEndpoint::auth_decision(
+        const NetworkAddress& remote, const std::optional<std::string>& maybe_auth) const
     {
         auto& netconf = router.config().network;
+        const auto auth_type = netconf.auth_type;
         auto& tokens = netconf.auth_static_tokens;
         auto& whitelist = netconf.auth_whitelist;
-        if (tokens.empty() && whitelist.empty())
-            return true;  // No auth required
 
-        if (maybe_auth && tokens.contains(*maybe_auth))
-            return true;  // valid auth token
+        // Open endpoint only when auth is explicitly disabled and no static lists are configured.
+        // Unchanged from upstream; this does not switch the endpoint to open auth.
+        const bool open_none_empty_lists =
+            auth_type == auth::AuthType::NONE && tokens.empty() && whitelist.empty();
 
-        if (whitelist.contains(remote))
-            return true;  // valid address
+        const bool static_token_hit = maybe_auth && tokens.contains(*maybe_auth);
 
-        return false;
+        // Whitelist hit is checked before lease admission.
+        const bool whitelist_hit = whitelist.contains(remote);
+
+        // Lease admission: signed record from the seller's issuer (SR_EXIT_LEASE_ISSUER_PUBKEY) in the
+        // store file SR_EXIT_LEASE_ADMISSIONS. Either unset = nobody admitted by this path (fail closed).
+        // Seller is this exit's own client .sesh, never an env override.
+        const char* store_env = std::getenv("SR_EXIT_LEASE_ADMISSIONS");
+        const std::string_view store = (store_env && store_env[0]) ? std::string_view{store_env} : std::string_view{};
+        const char* issuer_env = std::getenv("SR_EXIT_LEASE_ISSUER_PUBKEY");
+        const std::string_view issuer =
+            (issuer_env && issuer_env[0]) ? std::string_view{issuer_env} : std::string_view{};
+        std::string this_seller;
+        try
+        {
+            if (!router.is_service_node)
+                this_seller = NetworkAddress{router.key_manager.router_id(), true}.to_string();
+        }
+        catch (...)
+        {
+            this_seller.clear();
+        }
+
+        const auto now_unix = std::chrono::duration_cast<std::chrono::seconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+
+        const auto decided = srouter::auth::exit_lease_auth_allows(
+            open_none_empty_lists,
+            static_token_hit,
+            whitelist_hit,
+            store,
+            issuer,
+            this_seller,
+            remote.to_string(),
+            static_cast<std::int64_t>(now_unix));
+
+        if (!decided.allow && !store.empty())
+            log::debug(logcat, "exit_lease admission did not admit {} ({}): {}", remote, decided.reason, this_seller);
+
+        return decided;
+    }
+
+    bool SessionEndpoint::validate(const NetworkAddress& remote, std::optional<std::string> maybe_auth)
+    {
+        const auto decided = auth_decision(remote, maybe_auth);
+        if (decided.allow && std::string_view{decided.reason} == "admission")
+        {
+            // Remember the lease end so tick() drops the session when it lapses.
+            if (_lease_sessions.exp_of(remote) != decided.exp)
+                log::info(
+                    logcat,
+                    "Inbound session admitted by signed exit_lease admission (not whitelist): {} until {}",
+                    remote,
+                    decided.exp);
+            _lease_sessions.admitted(remote, decided.exp);
+        }
+        else if (decided.allow)
+            _lease_sessions.forget(remote);  // allowed by open/token/whitelist; no lease clock
+        return decided.allow;
+    }
+
+    void SessionEndpoint::enforce_lease_expiry(sys_ms now)
+    {
+        const auto now_s = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+        for (const auto& remote : _lease_sessions.due(static_cast<std::int64_t>(now_s)))
+        {
+            const auto decided = auth_decision(remote, std::nullopt);
+            const bool have_session = _sessions.contains(remote);
+            if (decided.allow)
+            {
+                if (std::string_view{decided.reason} == "admission")
+                    _lease_sessions.admitted(remote, decided.exp);  // renewed or unchanged
+                else
+                    _lease_sessions.forget(remote);
+                continue;
+            }
+            _lease_sessions.forget(remote);
+            if (have_session)
+            {
+                log::warning(
+                    logcat, "Dropping exit session for {}: lease no longer valid ({})", remote, decided.reason);
+                close_session(remote, /*send_close=*/true);
+            }
+        }
     }
 
     std::optional<ipv4> SessionEndpoint::map_session_v4(const session::Session& s)
     {
         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+
+        if (!validate(s.remote()))
+        {
+            log::warning(logcat, "Refusing ipv4 map for non-authorized remote {}", s.remote());
+            return std::nullopt;
+        }
 
         if (const auto& tun = router.tun_endpoint())
         {
@@ -1066,6 +1162,12 @@ namespace srouter::handlers
     std::optional<ipv6> SessionEndpoint::map_session_v6(const session::Session& s)
     {
         log::trace(logcat, "{} called", __PRETTY_FUNCTION__);
+
+        if (!validate(s.remote()))
+        {
+            log::warning(logcat, "Refusing ipv6 map for non-authorized remote {}", s.remote());
+            return std::nullopt;
+        }
 
         if (const auto& tun = router.tun_endpoint())
         {
@@ -1118,6 +1220,18 @@ namespace srouter::handlers
 
     void SessionEndpoint::session_post_init(std::shared_ptr<session::InboundSession> new_session)
     {
+        // Enforce [network] auth-type / auth-whitelist / auth-static before any map or accept.
+        // Without this gate, auth-type=whitelist was parsed into config but never applied on the
+        // inbound path (unlisted clients were mapped and could forward).
+        if (!validate(new_session->remote()))
+        {
+            log::warning(
+                logcat,
+                "Inbound session rejected by auth policy (not whitelisted / no valid auth): {}",
+                new_session->remote());
+            return;
+        }
+
         // FIXME: for now only tun clients can have inbound sessions, but eventually that will
         //        not be the case and we'll need to "if tun" this.
         if (!map_session_v6(*new_session))

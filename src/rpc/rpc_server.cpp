@@ -11,6 +11,8 @@
 #include <oxenc/base32z.h>
 
 #include <exception>
+#include <utility>
+#include <string_view>
 #include <vector>
 
 namespace srouter::rpc
@@ -653,6 +655,13 @@ namespace srouter::rpc
                     entry["session_live"] = false;
                     entry["exit_capable"] = false;
                 }
+                bool routes_up = false;
+                std::string_view routes_reason{"no vpn interface"};
+                if (const auto& tun = _router.tun_endpoint())
+                    std::tie(routes_up, routes_reason) = tun->exit_route_status();
+                entry["routes_up"] = routes_up;
+                if (not routes_up and not routes_reason.empty())
+                    entry["routes_reason"] = routes_reason;
                 exits.push_back(std::move(entry));
             }
             return exits;
